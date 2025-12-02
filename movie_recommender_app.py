@@ -1,3 +1,4 @@
+# movie_recommender_app.py
 # Usage: streamlit run movie_recommender_app.py
 
 import streamlit as st
@@ -6,31 +7,33 @@ import ast
 import numpy as np
 import os
 import hashlib
-from sentence_transformers import SentenceTransformer, CrossEncoder
-from sklearn.preprocessing import normalize
+from sentence_transformers import SentenceTransformer
+
+# Keras / TensorFlow
+import tensorflow as tf
+from tensorflow.keras import layers, Model
 
 # ---------- CONFIG ----------
 MOVIES_CSV = "tmdb_5000_movies.csv"
 CREDITS_CSV = "tmdb_5000_credits.csv"
-DEFAULT_MODEL = "all-MiniLM-L6-v2"  # fast, high-quality for many tasks
+DEFAULT_MODEL = "all-MiniLM-L6-v2"  # SBERT model for embeddings
 EMBEDDINGS_DIR = "embeddings_cache"
 EMBEDDINGS_DTYPE = np.float32
-# threshold for switching to ANN; for small datasets brute-force dot product is fine
-ANN_THRESHOLD = 5000
+
+ANN_MODEL_DIR = "ann_models"
 # ----------------------------
 
 os.makedirs(EMBEDDINGS_DIR, exist_ok=True)
+os.makedirs(ANN_MODEL_DIR, exist_ok=True)
 
 # ---------- Utilities ----------
 
 def file_md5(path):
-    """Compute md5 of a file for change detection."""
     h = hashlib.md5()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
-
 
 def extract_names_from_literal(text):
     if not isinstance(text, str):
@@ -42,7 +45,6 @@ def extract_names_from_literal(text):
     except Exception:
         return []
 
-
 def extract_cast_names(text, top_k=5):
     if not isinstance(text, str):
         return []
@@ -53,7 +55,6 @@ def extract_cast_names(text, top_k=5):
     except Exception:
         return []
 
-
 def extract_directors(crew_text):
     if not isinstance(crew_text, str):
         return []
@@ -63,7 +64,6 @@ def extract_directors(crew_text):
         return directors
     except Exception:
         return []
-
 
 def build_document(row):
     parts = []
@@ -78,27 +78,20 @@ def build_document(row):
     parts.extend([d.replace(" ", "_") for d in row.get("directors", []) if d])
     return " ".join([p for p in parts if p])
 
-
 @st.cache_data
 def load_and_merge(movies_path=MOVIES_CSV, credits_path=CREDITS_CSV):
-    """Load csvs, normalize column names, find title column robustly,
-       merge, parse lists, and build a textual document per movie."""
-    # --- load CSVs ---
     movies = pd.read_csv(movies_path)
     credits = pd.read_csv(credits_path)
 
-    # --- normalize column names: strip whitespace & lower for safe checks ---
     movies.columns = movies.columns.map(lambda c: c.strip() if isinstance(c, str) else c)
     credits.columns = credits.columns.map(lambda c: c.strip() if isinstance(c, str) else c)
 
-    # --- detect title column in movies: try several common options ---
     title_candidates = ['title', 'original_title', 'name']
     found_title_col = None
     for cand in title_candidates:
         if cand in movies.columns:
             found_title_col = cand
             break
-    # if not found, try any column that contains 'title' substring (case-insensitive)
     if found_title_col is None:
         for c in movies.columns:
             if isinstance(c, str) and 'title' in c.lower():
@@ -106,15 +99,11 @@ def load_and_merge(movies_path=MOVIES_CSV, credits_path=CREDITS_CSV):
                 break
 
     if found_title_col is None:
-        # fallback: create a synthetic title column using index to avoid missing column errors
         movies['title'] = movies.index.astype(str)
     else:
-        # unify into 'title' column and ensure strings
         movies['title'] = movies[found_title_col].astype(str)
 
-    # also normalize credits title column if exists
     if 'title' not in credits.columns:
-        # try to find candidate in credits too
         for cand in title_candidates:
             if cand in credits.columns:
                 credits['title'] = credits[cand].astype(str)
@@ -122,8 +111,6 @@ def load_and_merge(movies_path=MOVIES_CSV, credits_path=CREDITS_CSV):
     else:
         credits['title'] = credits['title'].astype(str)
 
-    # --- Merge robustly: prefer id/movie_id, otherwise merge on cleaned title ---
-    # strip whitespace and lower-case titles for more reliable merge
     movies['__join_title'] = movies['title'].fillna('').astype(str).str.strip().str.lower()
     credits['__join_title'] = credits['title'].fillna('').astype(str).str.strip().str.lower()
 
@@ -132,17 +119,14 @@ def load_and_merge(movies_path=MOVIES_CSV, credits_path=CREDITS_CSV):
     else:
         merged = pd.merge(movies, credits, left_on='__join_title', right_on='__join_title', how='left', suffixes=('', '_cred'))
 
-    # ensure we have a clean 'title' column in merged DF (take movies.title primarily)
     merged['title'] = merged.get('title', merged.get('title_cred', merged.get(found_title_col, merged.index.astype(str)))).astype(str)
 
-    # --- parse fields safely ---
     merged['genres_list'] = merged['genres'].apply(extract_names_from_literal) if 'genres' in merged.columns else [[] for _ in range(len(merged))]
     merged['keywords_list'] = merged['keywords'].apply(extract_names_from_literal) if 'keywords' in merged.columns else [[] for _ in range(len(merged))]
     merged['cast_list'] = merged['cast'].apply(lambda x: extract_cast_names(x, top_k=5)) if 'cast' in merged.columns else [[] for _ in range(len(merged))]
     merged['directors'] = merged['crew'].apply(extract_directors) if 'crew' in merged.columns else [[] for _ in range(len(merged))]
     merged['overview'] = merged['overview'].fillna('') if 'overview' in merged.columns else [''] * len(merged)
 
-    # --- build document and ensure title column has no empty strings ---
     def build_doc(row):
         parts = []
         title = str(row.get('title', '')).strip()
@@ -159,47 +143,46 @@ def load_and_merge(movies_path=MOVIES_CSV, credits_path=CREDITS_CSV):
 
     merged['document'] = merged.apply(build_doc, axis=1)
 
-    # ensure 'title' field is filled: if empty, try to extract from document (first token(s))
     def ensure_title(row):
         t = str(row.get('title', '')).strip()
         if t:
             return t
         doc = str(row.get('document', '')).strip()
         if doc:
-            # take first up-to-4 tokens as fallback title (replace underscores)
             tokens = doc.split()
             fallback = " ".join(tokens[:4]).replace('_', ' ')
             return fallback
         return ''
 
     merged['title'] = merged.apply(ensure_title, axis=1)
-
     merged = merged[merged['document'].str.strip().astype(bool)].reset_index(drop=True)
     return merged
 
-
 @st.cache_resource
-def load_model(model_name=DEFAULT_MODEL):
-    """Load SBERT model and cache resource across reruns."""
+def load_sbert(model_name=DEFAULT_MODEL):
     return SentenceTransformer(model_name)
 
-
-def embeddings_cache_path(data_hash, model_name):
+def embeddings_cache_path(data_hash, model_name, view_name):
     safe_model = model_name.replace("/", "_")
-    return os.path.join(EMBEDDINGS_DIR, f"emb_{safe_model}_{data_hash}.npy")
-
+    return os.path.join(EMBEDDINGS_DIR, f"emb_{safe_model}_{view_name}_{data_hash}.npy")
 
 @st.cache_data
-def encode_movies(documents, model_name=DEFAULT_MODEL, force_recompute=False, data_hash=None):
-    """Encode documents into normalized float32 embeddings. If cache file exists, load it."""
-    cache_path = embeddings_cache_path(data_hash or "nodata", model_name)
+def encode_documents(documents, model_name=DEFAULT_MODEL, force_recompute=False, data_hash=None, view_name="a"):
+    # validate input
+    if documents is None:
+        raise ValueError("No documents provided to encode.")
+    if not hasattr(documents, "__len__"):
+        raise ValueError("Documents must be a list-like of strings.")
+    # convert to list of str, ensure no None
+    docs = ["" if d is None else str(d) for d in documents]
+    # create cache path
+    cache_path = embeddings_cache_path(data_hash or "nodata", model_name, view_name)
     if os.path.exists(cache_path) and not force_recompute:
         emb = np.load(cache_path)
         return emb
 
-    model = load_model(model_name)
-    embeddings = model.encode(documents, show_progress_bar=True, convert_to_numpy=True, batch_size=64)
-    # normalize and cast to float32
+    model = load_sbert(model_name)
+    embeddings = model.encode(docs, show_progress_bar=True, convert_to_numpy=True, batch_size=64)
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
     norms[norms == 0] = 1
     embeddings = embeddings / norms
@@ -207,92 +190,161 @@ def encode_movies(documents, model_name=DEFAULT_MODEL, force_recompute=False, da
     np.save(cache_path, embeddings)
     return embeddings
 
+def projector_model_path(data_hash):
+    return os.path.join(ANN_MODEL_DIR, f"proj_model_{data_hash}.h5")
 
-def try_import_faiss():
-    try:
-        import faiss
-        return faiss
-    except Exception:
-        return None
+def projections_path(data_hash):
+    return os.path.join(ANN_MODEL_DIR, f"movie_projs_{data_hash}.npy")
 
+def build_projector(input_dim, proj_dim=256, hidden_sizes=[512, 256], dropout=0.2):
+    inp = layers.Input(shape=(input_dim,), name="sbert_input")
+    x = inp
+    for i, h in enumerate(hidden_sizes):
+        x = layers.Dense(h, activation="relu", name=f"dense_{i}")(x)
+        x = layers.Dropout(dropout)(x)
+    x = layers.Dense(proj_dim, name="proj")(x)
+    x = tf.keras.layers.Lambda(lambda t: tf.math.l2_normalize(t, axis=1), name="l2norm")(x)
+    model = Model(inputs=inp, outputs=x, name="ann_projector")
+    return model
 
-def build_faiss_index(movie_embeddings):
-    faiss = try_import_faiss()
-    if faiss is None:
-        return None
-    d = movie_embeddings.shape[1]
-    # use inner product on normalized vectors to approximate cosine similarity
-    index = faiss.IndexHNSWFlat(d, 32)
-    index.hnsw.efConstruction = 200
-    index.add(movie_embeddings)
-    return index
+@tf.function
+def nt_xent_loss(za, zb, temperature=0.07):
+    batch_size = tf.shape(za)[0]
+    logits = tf.matmul(za, zb, transpose_b=True) / temperature
+    labels = tf.range(batch_size)
+    loss_fn = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True, reduction=tf.keras.losses.Reduction.NONE)
+    loss_a = loss_fn(labels, logits)
+    loss_b = loss_fn(labels, tf.transpose(logits))
+    loss = 0.5 * (tf.reduce_mean(loss_a) + tf.reduce_mean(loss_b))
+    return loss
 
-
-def ann_search(index, q_emb, top_k=10):
-    # faiss expects (n, d) float32
-    D, I = index.search(q_emb.astype(np.float32), top_k)
-    # if using IndexHNSWFlat and normalized vectors, D is inner product (higher better)
-    return I[0], D[0]
-
-
-def brute_force_search(movie_embeddings, q_emb, top_k=10):
-    sims = np.dot(movie_embeddings, q_emb.T).squeeze(1)
-    top_idx = np.argsort(-sims)[:top_k]
-    return top_idx, sims[top_idx]
-
-
-def re_rank_with_crossencoder(query, docs_texts, indices, cross_model_name):
-    try:
-        cross = CrossEncoder(cross_model_name)
-    except Exception:
-        return indices  # fallback if model cannot be loaded
-
-    pairs = [(query, docs_texts[i]) for i in indices]
-    scores = cross.predict(pairs)
-    order = np.argsort(-scores)
-    return [indices[i] for i in order]
-
-
-# ---------- Streamlit UI ----------
-
-def get_top_k_recommendations(query, movie_embeddings, movies_df, model, top_k=10, faiss_index=None, use_crossencoder=False, crossencoder_name=None, min_score=0.20):
-    q_emb = model.encode([query], convert_to_numpy=True)
-    q_emb = q_emb / np.linalg.norm(q_emb, ord=2, axis=1, keepdims=True)
-    q_emb = q_emb.astype(EMBEDDINGS_DTYPE)
-
-    if faiss_index is not None:
-        idxs, scores = ann_search(faiss_index, q_emb, top_k=top_k)
+def train_projector(projector, emb_a, emb_b, epochs=10, batch_size=256, lr=1e-3, temperature=0.07,
+                    val_split=0.05, patience=5, save_path=None):
+    n = emb_a.shape[0]
+    assert emb_a.shape == emb_b.shape
+    if val_split and val_split > 0 and val_split < 1.0:
+        idx = np.arange(n)
+        np.random.shuffle(idx)
+        cut = int(n * (1 - val_split))
+        train_idx, val_idx = idx[:cut], idx[cut:]
+        train_a, train_b = emb_a[train_idx], emb_b[train_idx]
+        val_a, val_b = emb_a[val_idx], emb_b[val_idx]
     else:
-        idxs, scores = brute_force_search(movie_embeddings, q_emb, top_k=top_k)
+        train_a, train_b = emb_a, emb_b
+        val_a = val_b = None
 
-    if use_crossencoder and crossencoder_name and len(idxs) > 0:
-        # rerank top results with cross encoder
-        texts = movies_df['document'].tolist()
-        idxs = re_rank_with_crossencoder(query, texts, idxs.tolist(), crossencoder_name)
-        scores = [float(0.0)] * len(idxs)  # cross scores not returned here, keep placeholder
+    dataset = tf.data.Dataset.from_tensor_slices((train_a, train_b))
+    dataset = dataset.shuffle(buffer_size=max(1, train_a.shape[0])).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
-    results = []
-    for i, idx in enumerate(np.atleast_1d(idxs)):
-        score = float(scores[i]) if isinstance(scores, (list, np.ndarray)) else float(scores)
-        if score < min_score and i >= 3:
-            # if score low and not top result, stop adding more
-            break
-        row = movies_df.iloc[int(idx)]
-        results.append({
-            "title": row.get('title', ''),
-            "release_date": row.get('release_date', ''),
-            "overview": row.get('overview', ''),
-            "genres": ", ".join(row.get('genres_list', [])),
-            "cast": ", ".join(row.get('cast_list', [])),
-            "score": score
-        })
-    return results
+    if val_a is not None:
+        val_dataset = tf.data.Dataset.from_tensor_slices((val_a, val_b)).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    else:
+        val_dataset = None
 
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+
+    best_val = np.inf
+    wait = 0
+    history = {"train_loss": [], "val_loss": []}
+
+    for epoch in range(1, epochs + 1):
+        total_loss = 0.0
+        it = 0
+        for batch_a, batch_b in dataset:
+            with tf.GradientTape() as tape:
+                za = projector(batch_a, training=True)
+                zb = projector(batch_b, training=True)
+                loss = nt_xent_loss(za, zb, temperature)
+            grads = tape.gradient(loss, projector.trainable_variables)
+            optimizer.apply_gradients(zip(grads, projector.trainable_variables))
+            total_loss += float(loss)
+            it += 1
+        avg_train_loss = total_loss / max(1, it)
+        history["train_loss"].append(avg_train_loss)
+
+        if val_dataset is not None:
+            total_val = 0.0
+            itv = 0
+            for vb_a, vb_b in val_dataset:
+                za_v = projector(vb_a, training=False)
+                zb_v = projector(vb_b, training=False)
+                vloss = nt_xent_loss(za_v, zb_v, temperature)
+                total_val += float(vloss)
+                itv += 1
+            avg_val_loss = total_val / max(1, itv)
+            history["val_loss"].append(avg_val_loss)
+        else:
+            avg_val_loss = avg_train_loss
+            history["val_loss"].append(avg_val_loss)
+
+        if avg_val_loss < best_val - 1e-6:
+            best_val = avg_val_loss
+            wait = 0
+            if save_path:
+                try:
+                    projector.save(save_path, include_optimizer=False)
+                except Exception:
+                    projector.save_weights(save_path + ".weights.h5")
+        else:
+            wait += 1
+            if wait >= patience:
+                break
+
+    return projector, history
+
+def compute_movie_projections(projector, movie_embeddings, batch_size=1024):
+    n = movie_embeddings.shape[0]
+    parts = []
+    for i in range(0, n, batch_size):
+        batch = movie_embeddings[i:i+batch_size].astype(np.float32)
+        p = projector(batch, training=False).numpy()
+        parts.append(p)
+    allp = np.vstack(parts)
+    norms = np.linalg.norm(allp, axis=1, keepdims=True)
+    norms[norms == 0] = 1
+    allp = allp / norms
+    return allp.astype(np.float32)
+
+# ---------- Streamlit UI & Logic ----------
+
+def make_view_a(row):
+    return row.get("document", "")
+
+def make_view_b(row):
+    parts = []
+    title = row.get("title", "")
+    if title:
+        parts.append(title)
+    overview = (row.get("overview") or "").strip()
+    if overview:
+        words = overview.split()
+        parts.append(" ".join(words[:30]))
+    genres = row.get("genres_list", [])
+    if genres:
+        parts.append(genres[0])
+    keywords = row.get("keywords_list", [])
+    if keywords:
+        parts.append(keywords[0])
+    cast = row.get("cast_list", [])
+    if cast:
+        parts.append(cast[0])
+    return " ".join([p for p in parts if p])
+
+def ensure_views_exist(df):
+    # create missing view columns robustly
+    if 'view_a' not in df.columns:
+        df['view_a'] = df.apply(make_view_a, axis=1)
+    if 'view_b' not in df.columns:
+        df['view_b'] = df.apply(make_view_b, axis=1)
+    # cast to str and fillna
+    df['view_a'] = df['view_a'].fillna('').astype(str)
+    df['view_b'] = df['view_b'].fillna('').astype(str)
+    return df
 
 def main():
-    st.set_page_config(page_title="Chatbot Movie Recommender", layout="wide")
-    st.title("Chatbot Movie Recommender (SBERT + Cosine Sim + Optional ANN)")
-    st.markdown("Type a short description like: 'serial thriller about secret agent' and get movie recommendations.")
+    st.set_page_config(page_title="ANN Movie Recommender (SBERT -> Projector ANN)", layout="wide")
+    st.title("ANN Movie Recommender - SBERT for embedding, ANN as projector")
+    st.markdown("Pipeline: two views -> SBERT encode -> ANN projector trained via contrastive loss -> retrieval by cosine similarity.")
 
     with st.spinner("Loading dataset..."):
         try:
@@ -303,13 +355,18 @@ def main():
 
     st.sidebar.header("Settings")
     model_name = st.sidebar.text_input("SBERT model name", value=DEFAULT_MODEL)
-    top_k = st.sidebar.slider("Number of results to show", min_value=3, max_value=20, value=10)
-    use_ann = st.sidebar.checkbox("Use ANN (FAISS) if available", value=True)
-    use_cross = st.sidebar.checkbox("Use cross-encoder re-ranking (slower)", value=False)
-    cross_model_name = st.sidebar.text_input("Cross-encoder model name", value="cross-encoder/ms-marco-MiniLM-L-6-v2") if use_cross else None
-    min_score = st.sidebar.slider("Minimum similarity score (0-1)", min_value=0.0, max_value=1.0, value=0.18, step=0.01)
+    top_k = st.sidebar.slider("Top K results", min_value=3, max_value=50, value=10)
+    proj_dim = st.sidebar.number_input("Projection dim", min_value=32, max_value=2048, value=256)
+    hidden1 = st.sidebar.number_input("Hidden size 1", min_value=32, max_value=4096, value=512)
+    hidden2 = st.sidebar.number_input("Hidden size 2", min_value=0, max_value=4096, value=256)
+    dropout = st.sidebar.slider("Dropout", min_value=0.0, max_value=0.8, value=0.2)
+    epochs = st.sidebar.number_input("Training epochs", min_value=1, max_value=500, value=20)
+    batch_size = st.sidebar.number_input("Training batch size", min_value=8, max_value=4096, value=256)
+    lr = st.sidebar.number_input("Learning rate", min_value=1e-6, max_value=1.0, value=1e-3, format="%.6f")
+    temperature = st.sidebar.number_input("NT-Xent temperature", min_value=0.01, max_value=1.0, value=0.07, format="%.3f")
+    force_reencode = st.sidebar.checkbox("Force re-encode documents", value=False)
+    force_reproj = st.sidebar.checkbox("Force recompute projections", value=False)
 
-    # compute data hash from CSVs to version embeddings
     try:
         movies_hash = file_md5(MOVIES_CSV)
         credits_hash = file_md5(CREDITS_CSV)
@@ -318,65 +375,228 @@ def main():
         credits_hash = "nofilehash"
     data_hash = hashlib.md5((movies_hash + credits_hash).encode()).hexdigest()[:8]
 
-    # load or compute embeddings
-    emb_cache_path = embeddings_cache_path(data_hash, model_name)
-    if 'movie_embeddings' not in st.session_state or st.session_state.get('emb_cache') != emb_cache_path:
-        with st.spinner("Loading SBERT model and encoding movies (may take a while)..."):
+    st.header("Prepare views & encode")
+    st.write("View A = full document. View B = title + short overview + first genre/keyword/cast.")
+
+    # always ensure views exist for current movies_df
+    movies_df = ensure_views_exist(movies_df)
+    st.session_state['views_ready'] = True
+
+    if 'sbert_model' not in st.session_state or st.session_state.get('sbert_name') != model_name:
+        with st.spinner("Loading SBERT model..."):
             try:
-                movie_docs = movies_df['document'].tolist()
-                movie_embeddings = encode_movies(movie_docs, model_name=model_name, data_hash=data_hash)
-                st.session_state['movie_embeddings'] = movie_embeddings
-                st.session_state['emb_cache'] = emb_cache_path
-                st.session_state['sbert_model'] = load_model(model_name)
+                sbert = load_sbert(model_name)
+                st.session_state['sbert_model'] = sbert
+                st.session_state['sbert_name'] = model_name
             except Exception as e:
-                st.error(f"Failed to encode or load model: {e}")
+                st.error(f"Failed to load SBERT: {e}")
                 st.stop()
     else:
-        movie_embeddings = st.session_state['movie_embeddings']
+        sbert = st.session_state['sbert_model']
 
-    # build or load ANN index if requested and dataset large
-    faiss_index = None
-    faiss = None
-    if use_ann and movie_embeddings.shape[0] >= ANN_THRESHOLD:
-        faiss = try_import_faiss()
-        if faiss is not None:
-            if 'faiss_index' not in st.session_state or st.session_state.get('faiss_idx_size') != movie_embeddings.shape[0]:
-                with st.spinner("Building FAISS HNSW index for fast search..."):
-                    try:
-                        faiss_index = build_faiss_index(movie_embeddings)
-                        st.session_state['faiss_index'] = faiss_index
-                        st.session_state['faiss_idx_size'] = movie_embeddings.shape[0]
-                    except Exception:
-                        st.session_state['faiss_index'] = None
-                        st.session_state['faiss_idx_size'] = 0
-            else:
-                faiss_index = st.session_state.get('faiss_index')
+    emb_a_path = embeddings_cache_path(data_hash, model_name, "viewA")
+    emb_b_path = embeddings_cache_path(data_hash, model_name, "viewB")
+
+    if st.button("Encode views with SBERT"):
+        with st.spinner("Encoding view A and view B..."):
+            try:
+                # make absolutely sure columns exist and are strings
+                movies_df = ensure_views_exist(movies_df)
+                docs_a = movies_df['view_a'].astype(str).fillna('').tolist()
+                docs_b = movies_df['view_b'].astype(str).fillna('').tolist()
+                if len(docs_a) == 0 or len(docs_b) == 0:
+                    st.error("No documents to encode. Check dataset and views.")
+                else:
+                    emb_a = encode_documents(docs_a, model_name=model_name, data_hash=data_hash, force_recompute=force_reencode, view_name="viewA")
+                    emb_b = encode_documents(docs_b, model_name=model_name, data_hash=data_hash, force_recompute=force_reencode, view_name="viewB")
+                    st.session_state['emb_a'] = emb_a
+                    st.session_state['emb_b'] = emb_b
+                    st.success(f"Encoded: saved to {emb_a_path} and {emb_b_path}")
+            except Exception as e:
+                # more informative error report
+                st.error(f"Encoding failed: {type(e).__name__}: {e}")
+                # also print a helpful hint
+                st.write("Hint: make sure TMDB CSV files are present and contain expected columns like 'overview', 'genres'.")
+                st.stop()
+
+    # Try to load embeddings from session or disk
+    if 'emb_a' not in st.session_state:
+        if os.path.exists(emb_a_path) and os.path.exists(emb_b_path) and not force_reencode:
+            try:
+                st.session_state['emb_a'] = np.load(emb_a_path)
+                st.session_state['emb_b'] = np.load(emb_b_path)
+                st.success("Loaded cached embeddings from disk.")
+            except Exception:
+                st.info("Embeddings cache not loadable; click 'Encode views with SBERT'.")
         else:
-            st.sidebar.warning("faiss not installed. Falling back to exact search.")
+            st.info("No embeddings cached. Click 'Encode views with SBERT' to create them.")
 
-    # chat input
-    user_input = st.text_input("Ask me for movie recommendations:", placeholder="e.g. superhero film where the hero has supernatural power")
-    if st.button("Recommend") and user_input:
-        with st.spinner("Searching for best matches..."):
-            model = st.session_state.get('sbert_model')
-            results = get_top_k_recommendations(user_input, movie_embeddings, movies_df, model,
-                                                top_k=top_k, faiss_index=faiss_index if faiss is not None else None,
-                                                use_crossencoder=use_cross, crossencoder_name=cross_model_name,
-                                                min_score=min_score)
+    if 'emb_a' in st.session_state:
+        emb_a = st.session_state['emb_a']
+        emb_b = st.session_state['emb_b']
+        st.sidebar.markdown(f"**Dataset:** {emb_a.shape[0]} items  •  SBERT dim: {emb_a.shape[1]}")
+    else:
+        emb_a = emb_b = None
+
+    # Projector management
+    proj_path = projector_model_path(data_hash)
+    projs_path = projections_path(data_hash)
+
+    st.header("Train projector ANN (contrastive)")
+    st.write("Training trains ANN projector to map SBERT embeddings to projection space using NT-Xent (in-batch negatives).")
+
+    if os.path.exists(proj_path) and 'projector_loaded' not in st.session_state:
+        st.sidebar.success(f"Found saved projector: {proj_path}")
+        if st.sidebar.button("Load saved projector"):
+            try:
+                projector = tf.keras.models.load_model(proj_path)
+                st.session_state['projector'] = projector
+                st.session_state['projector_loaded'] = True
+                st.success("Projector loaded.")
+            except Exception as e:
+                st.error(f"Failed to load projector: {e}")
+
+    if st.button("Build projector (not train)"):
+        if emb_a is None:
+            st.error("No embeddings available. Encode views first.")
+        else:
+            try:
+                hiddens = [hidden1] + ([hidden2] if hidden2 > 0 else [])
+                projector = build_projector(input_dim=emb_a.shape[1], proj_dim=int(proj_dim), hidden_sizes=hiddens, dropout=float(dropout))
+                st.session_state['projector'] = projector
+                st.success("Projector model built and stored in session.")
+            except Exception as e:
+                st.error(f"Failed to build projector: {e}")
+
+    if st.button("Train projector now"):
+        if emb_a is None:
+            st.error("No embeddings available. Encode views first.")
+        else:
+            projector = st.session_state.get('projector') or build_projector(input_dim=emb_a.shape[1], proj_dim=int(proj_dim), hidden_sizes=[hidden1] + ([hidden2] if hidden2 > 0 else []), dropout=float(dropout))
+            st.session_state['projector'] = projector
+            with st.spinner("Training projector (contrastive) ..."):
+                try:
+                    proj_model, history = train_projector(
+                        projector,
+                        emb_a.astype(np.float32),
+                        emb_b.astype(np.float32),
+                        epochs=int(epochs),
+                        batch_size=int(batch_size),
+                        lr=float(lr),
+                        temperature=float(temperature),
+                        val_split=0.05,
+                        patience=5,
+                        save_path=proj_path
+                    )
+                    st.session_state['projector'] = proj_model
+                    st.success("Training finished. Projector saved (best) if possible.")
+                    st.session_state['proj_history'] = history
+                except Exception as e:
+                    st.error(f"Projector training failed: {type(e).__name__}: {e}")
+
+    if st.button("Compute & save movie projections"):
+        if 'projector' not in st.session_state:
+            st.error("No projector in session. Build or load projector first.")
+        elif 'emb_a' not in st.session_state:
+            st.error("No embeddings. Encode views first.")
+        else:
+            projector = st.session_state['projector']
+            with st.spinner("Computing projections for all movies..."):
+                try:
+                    base_embeddings = st.session_state['emb_a'].astype(np.float32)
+                    movie_projs = compute_movie_projections(projector, base_embeddings, batch_size=1024)
+                    np.save(projs_path, movie_projs)
+                    st.session_state['movie_projs'] = movie_projs
+                    st.success(f"Computed projections and saved to {projs_path}")
+                except Exception as e:
+                    st.error(f"Failed to compute projections: {type(e).__name__}: {e}")
+
+    if 'movie_projs' not in st.session_state:
+        if os.path.exists(projs_path) and not force_reproj:
+            try:
+                st.session_state['movie_projs'] = np.load(projs_path)
+                st.success("Loaded cached movie projections from disk.")
+            except Exception:
+                pass
+
+    st.header("Get recommendations (inference)")
+    user_input = st.text_input("Describe what you want to watch (e.g. 'serial thriller about secret agent')", "")
+
+    if st.button("Recommend") and user_input.strip():
+        if 'projector' not in st.session_state:
+            if os.path.exists(proj_path):
+                try:
+                    st.session_state['projector'] = tf.keras.models.load_model(proj_path)
+                except Exception:
+                    st.error("Projector not in session and failed to load from disk. Train or load projector first.")
+                    st.stop()
+            else:
+                st.error("No projector available. Train projector first.")
+                st.stop()
+
+        if 'movie_projs' not in st.session_state:
+            if os.path.exists(projs_path):
+                try:
+                    st.session_state['movie_projs'] = np.load(projs_path)
+                except Exception:
+                    st.error("Movie projections not in session and failed to load from disk. Compute projections first.")
+                    st.stop()
+            else:
+                st.error("No movie projections available. Compute & save projections first.")
+                st.stop()
+
+        projector = st.session_state['projector']
+        movie_projs = st.session_state['movie_projs']
+        sbert = st.session_state.get('sbert_model') or load_sbert(model_name)
+
+        try:
+            q_emb = sbert.encode([user_input], convert_to_numpy=True)
+            q_emb = q_emb / np.linalg.norm(q_emb, ord=2, axis=1, keepdims=True)
+            q_emb = q_emb.astype(np.float32)
+        except Exception as e:
+            st.error(f"Failed to encode query with SBERT: {type(e).__name__}: {e}")
+            st.stop()
+
+        try:
+            q_proj = projector(q_emb, training=False).numpy()
+            sims = np.dot(q_proj, movie_projs.T)[0]
+            top_idx = np.argsort(-sims)[:top_k]
+            top_scores = sims[top_idx]
+        except Exception as e:
+            st.error(f"Inference failed: {type(e).__name__}: {e}")
+            st.stop()
+
+        results = []
+        for idx, score in zip(top_idx, top_scores):
+            row = movies_df.iloc[int(idx)]
+            results.append({
+                "title": row.get('title', ''),
+                "release_date": row.get('release_date', ''),
+                "overview": row.get('overview', ''),
+                "genres": ", ".join(row.get('genres_list', [])),
+                "cast": ", ".join(row.get('cast_list', [])),
+                "score": float(score)
+            })
 
         if not results:
-            st.info("No good matches found. Try a different query or make your query more specific.")
+            st.info("No recommendations produced. Try another query or retrain projector.")
         else:
             st.subheader(f"Top {len(results)} recommendations for: \"{user_input}\"")
             for i, r in enumerate(results, 1):
-                st.markdown(f"**{i}. {r['title']}**  ")
-                st.write(f"Score: {r['score']:.4f}  ")
-                st.write(f"Release date: {r.get('release_date','N/A')}  ")
+                st.markdown(f"**{i}. {r['title']}**")
+                st.write(f"Score: {r['score']:.6f}")
+                st.write(f"Release date: {r.get('release_date','N/A')}")
                 st.write(r.get('overview',''))
                 st.write(f"Genres: {r.get('genres','N/A')}")
                 st.write(f"Cast: {r.get('cast','N/A')}")
                 st.markdown("---")
 
+    st.sidebar.markdown("---")
+    st.sidebar.write("Tips:")
+    st.sidebar.write("- For a quick baseline: after encode, try SBERT cosine nearest neighbors (np.dot) for comparison.")
+    st.sidebar.write("- In-batch negatives work better with a large batch size if memory allows.")
+    st.sidebar.write("- If dataset is large, use FAISS or hnswlib for retrieval on movie projections.")
+    st.sidebar.write("- Always keep embeddings and projections L2-normalized during training and inference.")
 
 if __name__ == "__main__":
     main()
